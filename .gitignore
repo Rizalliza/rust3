@@ -1,0 +1,6 @@
+.DS_Store
+.env
+target/
+docs.rs/
+node_modules/
+keyPair/

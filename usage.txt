@@ -1,0 +1,43 @@
+Usage summary for the transaction flow:
+
+- The bot builds a v0 Solana transaction, adds compute budget instructions, then appends the swap instruction.
+
+- It sends the transaction through each RPC client in `rpc_clients`.
+
+- If an RPC call fails with a rate-limit/429-style error, it retries with exponential backoff inside `send_transaction_with_retries()`.
+
+- Retry behavior:
+
+  - initial backoff: 250 ms
+  - doubles on each retry
+  - stops after `config.spam.max_retries` if configured, otherwise defaults to `3`
+
+- If the failure is not a rate-limit issue, it is logged as an error and the bot moves on to the next RPC client.
+
+Where to monitor and see results:
+
+- Terminal logs are the main place to watch runtime behavior.
+
+- `debug!` logs:
+
+  - sending via each RPC client
+  - building swap instruction
+
+- `warn!` logs:
+
+  - 429/rate-limit retries
+  - final rate-limited failures for a client
+
+- `info!` logs:
+  - successful transaction submissions with signature
+
+- `error!` logs:
+  - non-rate-limit submission failures
+
+What you get back:
+
+- `build_and_send_transaction(...)` returns `Vec<Signature>`.
+- Those signatures are the final proof of successful submissions.
+- You can paste the signature into Solana Explorer or your RPC provider’s explorer to confirm on-chain execution.
+
+This is the complete monitoring path for the current implementation.
