@@ -162,7 +162,7 @@ async fn send_transaction_with_retries(
     }
 }
 
-fn is_rate_limit_error(err: &str) -> bool {
+pub(crate) fn is_rate_limit_error(err: &str) -> bool {
     err.contains("429")
         || err.contains("Too Many Requests")
         || err.contains("rate limit")

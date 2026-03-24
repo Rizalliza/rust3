@@ -11,9 +11,8 @@ use solana_sdk::signer::Signer;
 use solana_sdk::{
     address_lookup_table::state::AddressLookupTable, compute_budget::ComputeBudgetInstruction,
 };
-use spl_associated_token_account::{
-    get_associated_token_address, get_associated_token_address_with_program_id,
-};
+use spl_associated_token_account::get_associated_token_address_with_program_id;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,8 +27,23 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
 
     let sending_rpc_clients = if let Some(spam_config) = &config.spam {
         if spam_config.enabled {
-            spam_config
+            let mut seen = HashSet::new();
+            let unique_urls = spam_config
                 .sending_rpc_urls
+                .iter()
+                .filter(|url| seen.insert((*url).clone()))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if unique_urls.len() < spam_config.sending_rpc_urls.len() {
+                warn!(
+                    "Duplicate sending RPC URLs detected ({} configured, {} unique). Duplicates can amplify 429 rate-limit failures.",
+                    spam_config.sending_rpc_urls.len(),
+                    unique_urls.len()
+                );
+            }
+
+            unique_urls
                 .iter()
                 .map(|url| Arc::new(RpcClient::new(url.clone())))
                 .collect::<Vec<_>>()
@@ -205,6 +219,10 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
             let process_delay = Duration::from_millis(mint_config_clone.process_delay);
             let mut last_submission_blockhash = Hash::default();
             let mut submitted_once = false;
+            let mut rate_limit_streak = 0u32;
+
+            // Prevent all mint workers from submitting in lock-step, which can trigger burst 429s.
+            tokio::time::sleep(Duration::from_millis(rand::random::<u64>() % 500)).await;
 
             loop {
                 let latest_blockhash = {
@@ -239,12 +257,26 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
                         }
                         submitted_once = true;
                         last_submission_blockhash = latest_blockhash;
+                        rate_limit_streak = 0;
                     }
                     Err(e) => {
                         error!(
                             "Error sending transaction for mint {}: {}",
                             mint_config_clone.mint, e
                         );
+
+                        if crate::transaction::is_rate_limit_error(&e.to_string()) {
+                            rate_limit_streak = rate_limit_streak.saturating_add(1);
+                            let cooldown_ms = 250u64
+                                .saturating_mul(2u64.saturating_pow(rate_limit_streak.min(4)));
+                            warn!(
+                                "Mint {} hit RPC 429 rate limits (streak {}). Cooling down for {}ms",
+                                mint_config_clone.mint, rate_limit_streak, cooldown_ms
+                            );
+                            tokio::time::sleep(Duration::from_millis(cooldown_ms)).await;
+                        } else {
+                            rate_limit_streak = 0;
+                        }
                     }
                 }
 
