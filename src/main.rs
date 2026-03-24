@@ -2,8 +2,11 @@ mod bot;
 mod config;
 mod constants;
 mod dex;
+mod metrics;
+mod paper_trading;
 mod pools;
 mod refresh;
+mod signer;
 mod transaction;
 
 use clap::{App, Arg};

@@ -1,5 +1,7 @@
 use crate::config::Config;
+use crate::metrics;
 use crate::refresh::initialize_pool_data;
+use crate::signer::{LocalKeypairSigner, TransactionSigner};
 use crate::transaction::build_and_send_transaction;
 use anyhow::Context;
 use solana_client::rpc_client::RpcClient;
@@ -11,9 +13,8 @@ use solana_sdk::signer::Signer;
 use solana_sdk::{
     address_lookup_table::state::AddressLookupTable, compute_budget::ComputeBudgetInstruction,
 };
-use spl_associated_token_account::{
-    get_associated_token_address, get_associated_token_address_with_program_id,
-};
+use spl_associated_token_account::get_associated_token_address_with_program_id;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,8 +29,23 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
 
     let sending_rpc_clients = if let Some(spam_config) = &config.spam {
         if spam_config.enabled {
-            spam_config
+            let mut seen = HashSet::new();
+            let unique_urls = spam_config
                 .sending_rpc_urls
+                .iter()
+                .filter(|url| seen.insert((*url).clone()))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if unique_urls.len() < spam_config.sending_rpc_urls.len() {
+                warn!(
+                    "Duplicate sending RPC URLs detected ({} configured, {} unique). Duplicates can amplify 429 rate-limit failures.",
+                    spam_config.sending_rpc_urls.len(),
+                    unique_urls.len()
+                );
+            }
+
+            unique_urls
                 .iter()
                 .map(|url| Arc::new(RpcClient::new(url.clone())))
                 .collect::<Vec<_>>()
@@ -42,7 +58,10 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
 
     let wallet_kp =
         load_keypair(&config.wallet.private_key).context("Failed to load wallet keypair")?;
-    info!("Wallet loaded: {}", wallet_kp.pubkey());
+    let wallet_signer = Arc::new(LocalKeypairSigner::new(
+        Keypair::from_bytes(&wallet_kp.to_bytes()).context("Failed to clone wallet keypair")?,
+    ));
+    info!("Wallet loaded: {}", wallet_signer.pubkey());
 
     let initial_blockhash = rpc_client.get_latest_blockhash()?;
     let cached_blockhash = Arc::new(Mutex::new(initial_blockhash));
@@ -50,8 +69,17 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
     let refresh_interval = Duration::from_secs(10);
     let blockhash_client = rpc_client.clone();
     let blockhash_cache = cached_blockhash.clone();
+    let should_serialize_submissions = config
+        .execution
+        .as_ref()
+        .and_then(|e| e.serialize_submissions)
+        .unwrap_or(true);
+    let submission_lock = Arc::new(Mutex::new(()));
     tokio::spawn(async move {
         blockhash_refresher(blockhash_client, blockhash_cache, refresh_interval).await;
+    });
+    tokio::spawn(async move {
+        metrics::metrics_reporter(Duration::from_secs(30)).await;
     });
 
     for mint_config in &config.routing.mint_config_list {
@@ -124,7 +152,7 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
 
         let pool_data = initialize_pool_data(
             &mint_config.mint,
-            &wallet_kp.pubkey().to_string(),
+            &wallet_signer.pubkey().to_string(),
             mint_config.raydium_pool_list.as_ref(),
             mint_config.raydium_cp_pool_list.as_ref(),
             mint_config.pump_pool_list.as_ref(),
@@ -147,8 +175,8 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
         let mint_config_clone = mint_config.clone();
         let sending_rpc_clients_clone = sending_rpc_clients.clone();
         let cached_blockhash_clone = cached_blockhash.clone();
-        let wallet_bytes = wallet_kp.to_bytes();
-        let wallet_kp_clone = Keypair::from_bytes(&wallet_bytes).unwrap();
+        let submission_lock_clone = submission_lock.clone();
+        let wallet_signer_clone = wallet_signer.clone();
         let mut lookup_table_accounts = mint_config_clone.lookup_table_accounts.unwrap_or_default();
         lookup_table_accounts.push("4sKLJ1Qoudh8PJyqBeuKocYdsZvxTcRShUt9aKqwhgvC".to_string());
 
@@ -205,6 +233,30 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
             let process_delay = Duration::from_millis(mint_config_clone.process_delay);
             let mut last_submission_blockhash = Hash::default();
             let mut submitted_once = false;
+            let mut rate_limit_streak = 0u32;
+            let startup_jitter_ms = config_clone
+                .spam
+                .as_ref()
+                .and_then(|s| s.worker_startup_jitter_ms)
+                .unwrap_or(500);
+            let rate_limit_cooldown_base_ms = config_clone
+                .spam
+                .as_ref()
+                .and_then(|s| s.rate_limit_cooldown_base_ms)
+                .unwrap_or(250);
+            let rate_limit_cooldown_max_ms = config_clone
+                .spam
+                .as_ref()
+                .and_then(|s| s.rate_limit_cooldown_max_ms)
+                .unwrap_or(8000);
+
+            // Prevent all mint workers from submitting in lock-step, which can trigger burst 429s.
+            if startup_jitter_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(
+                    rand::random::<u64>() % startup_jitter_ms,
+                ))
+                .await;
+            }
 
             loop {
                 let latest_blockhash = {
@@ -219,32 +271,69 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
 
                 let guard = mint_pool_data.lock().await;
 
-                match build_and_send_transaction(
-                    &wallet_kp_clone,
-                    &config_clone,
-                    &*guard, // Dereference the guard here
-                    &sending_rpc_clients_clone,
-                    latest_blockhash,
-                    &lookup_table_accounts_list,
-                )
-                .await
-                {
+                let result = if should_serialize_submissions {
+                    let _submit_guard = submission_lock_clone.lock().await;
+                    build_and_send_transaction(
+                        wallet_signer_clone.as_ref(),
+                        &config_clone,
+                        &*guard, // Dereference the guard here
+                        &sending_rpc_clients_clone,
+                        latest_blockhash,
+                        &lookup_table_accounts_list,
+                    )
+                    .await
+                } else {
+                    build_and_send_transaction(
+                        wallet_signer_clone.as_ref(),
+                        &config_clone,
+                        &*guard, // Dereference the guard here
+                        &sending_rpc_clients_clone,
+                        latest_blockhash,
+                        &lookup_table_accounts_list,
+                    )
+                    .await
+                };
+
+                match result {
                     Ok(signatures) => {
                         info!(
                             "Transactions sent successfully for mint {}",
                             mint_config_clone.mint
                         );
-                        for signature in signatures {
-                            info!("  Signature: {}", signature);
+                        if signatures.is_empty() {
+                            info!(
+                                "Paper-trading mode active: no transaction broadcast for mint {}",
+                                mint_config_clone.mint
+                            );
+                        } else {
+                            for signature in signatures {
+                                info!("  Signature: {}", signature);
+                            }
                         }
                         submitted_once = true;
                         last_submission_blockhash = latest_blockhash;
+                        rate_limit_streak = 0;
                     }
                     Err(e) => {
                         error!(
                             "Error sending transaction for mint {}: {}",
                             mint_config_clone.mint, e
                         );
+
+                        if crate::transaction::is_rate_limit_error(&e.to_string()) {
+                            rate_limit_streak = rate_limit_streak.saturating_add(1);
+                            let cooldown_ms = rate_limit_cooldown_base_ms
+                                .saturating_mul(2u64.saturating_pow(rate_limit_streak.min(4)))
+                                .min(rate_limit_cooldown_max_ms);
+                            warn!(
+                                "Mint {} hit RPC 429 rate limits (streak {}). Cooling down for {}ms",
+                                mint_config_clone.mint, rate_limit_streak, cooldown_ms
+                            );
+                            metrics::inc_cooldown_events();
+                            tokio::time::sleep(Duration::from_millis(cooldown_ms)).await;
+                        } else {
+                            rate_limit_streak = 0;
+                        }
                     }
                 }
 

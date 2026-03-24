@@ -2,16 +2,19 @@ use crate::config::Config;
 use crate::dex::raydium::{raydium_authority, raydium_cp_authority};
 use crate::dex::solfi::constants::solfi_program_id;
 use crate::dex::vertigo::constants::vertigo_program_id;
+use crate::metrics;
+use crate::paper_trading::{append_record_csv, PaperTradeRecord};
 use crate::pools::MintPoolData;
+use crate::signer::TransactionSigner;
 use solana_client::rpc_client::RpcClient;
+use solana_client::rpc_config::RpcSimulateTransactionConfig;
 use solana_program::instruction::Instruction;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::commitment_config::CommitmentLevel;
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use solana_sdk::hash::Hash;
 use solana_sdk::message::v0::Message;
-use solana_sdk::signature::{Keypair, Signature};
-use solana_sdk::signer::Signer;
+use solana_sdk::signature::Signature;
 use solana_sdk::transaction::VersionedTransaction;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,15 +37,63 @@ use solana_program::system_program;
 use spl_associated_token_account::ID as associated_token_program_id;
 use spl_token::ID as token_program_id;
 use std::str::FromStr;
+use std::sync::{Mutex, OnceLock};
+
+#[derive(Default, Clone, Copy)]
+struct RpcHealthStats {
+    successes: u64,
+    failures: u64,
+    rate_limits: u64,
+}
+
+impl RpcHealthStats {
+    fn score(&self) -> i64 {
+        (self.successes as i64 * 3) - (self.failures as i64) - (self.rate_limits as i64 * 2)
+    }
+}
+
+fn rpc_health_registry() -> &'static Mutex<std::collections::HashMap<usize, RpcHealthStats>> {
+    static REGISTRY: OnceLock<Mutex<std::collections::HashMap<usize, RpcHealthStats>>> =
+        OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn update_rpc_health(index: usize, success: bool, rate_limited: bool) {
+    if let Ok(mut registry) = rpc_health_registry().lock() {
+        let entry = registry.entry(index).or_default();
+        if success {
+            entry.successes = entry.successes.saturating_add(1);
+        } else if rate_limited {
+            entry.rate_limits = entry.rate_limits.saturating_add(1);
+        } else {
+            entry.failures = entry.failures.saturating_add(1);
+        }
+    }
+}
+
+fn prioritized_rpc_indices(client_count: usize) -> Vec<usize> {
+    let mut indices = (0..client_count).collect::<Vec<_>>();
+
+    if let Ok(registry) = rpc_health_registry().lock() {
+        indices.sort_by(|a, b| {
+            let score_a = registry.get(a).copied().unwrap_or_default().score();
+            let score_b = registry.get(b).copied().unwrap_or_default().score();
+            score_b.cmp(&score_a).then_with(|| a.cmp(b))
+        });
+    }
+
+    indices
+}
 
 pub async fn build_and_send_transaction(
-    wallet_kp: &Keypair,
+    signer: &dyn TransactionSigner,
     config: &Config,
     mint_pool_data: &MintPoolData,
     rpc_clients: &[Arc<RpcClient>],
     blockhash: Hash,
     address_lookup_table_accounts: &[AddressLookupTableAccount],
 ) -> anyhow::Result<Vec<Signature>> {
+    metrics::inc_tx_attempted();
     let enable_flashloan = config.flashloan.as_ref().map_or(false, |k| k.enabled);
     let compute_unit_limit = config.bot.compute_unit_limit;
     let mut instructions = vec![];
@@ -58,7 +109,7 @@ pub async fn build_and_send_transaction(
     instructions.push(compute_budget_price_ix);
 
     let swap_ix = create_swap_instruction(
-        wallet_kp,
+        signer.pubkey(),
         mint_pool_data,
         compute_unit_limit as u64,
         enable_flashloan,
@@ -70,16 +121,76 @@ pub async fn build_and_send_transaction(
     all_instructions.push(swap_ix);
 
     let message = Message::try_compile(
-        &wallet_kp.pubkey(),
+        &signer.pubkey(),
         &all_instructions,
         address_lookup_table_accounts,
         blockhash,
     )?;
 
-    let tx = VersionedTransaction::try_new(
-        solana_sdk::message::VersionedMessage::V0(message),
-        &[wallet_kp],
-    )?;
+    let tx = signer.sign_versioned_message(solana_sdk::message::VersionedMessage::V0(message))?;
+
+    let require_simulation_success = config
+        .execution
+        .as_ref()
+        .and_then(|e| e.require_simulation_success)
+        .unwrap_or(true);
+    let paper_trading_enabled = config
+        .paper_trading
+        .as_ref()
+        .map(|p| p.enabled)
+        .unwrap_or(false);
+
+    if require_simulation_success {
+        let simulation_client = rpc_clients
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no RPC clients configured for simulation"))?;
+        if let Err(err) = ensure_simulation_passes(simulation_client, &tx) {
+            metrics::inc_tx_sim_failed();
+            metrics::inc_tx_send_failed();
+            return Err(err);
+        }
+        metrics::inc_tx_sim_ok();
+    }
+
+    if paper_trading_enabled {
+        let compute_unit_price = config.spam.as_ref().map_or(1000, |s| s.compute_unit_price);
+        let priority_fee_lamports =
+            (compute_unit_limit as u64).saturating_mul(compute_unit_price) / 1_000_000;
+        let assumed_notional_lamports = config
+            .paper_trading
+            .as_ref()
+            .and_then(|p| p.assumed_notional_lamports)
+            .unwrap_or(1_000_000);
+        let assumed_slippage_bps = config
+            .paper_trading
+            .as_ref()
+            .and_then(|p| p.assumed_slippage_bps)
+            .unwrap_or(50);
+        let slippage_cost_lamports =
+            assumed_notional_lamports.saturating_mul(assumed_slippage_bps) / 10_000;
+        let estimated_net_lamports =
+            -((priority_fee_lamports.saturating_add(slippage_cost_lamports)) as i64);
+        let journal_path = config
+            .paper_trading
+            .as_ref()
+            .and_then(|p| p.journal_path.clone())
+            .unwrap_or_else(|| "paper_trades.csv".to_string());
+
+        let record = PaperTradeRecord {
+            timestamp_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default(),
+            mint: mint_pool_data.mint.to_string(),
+            simulation_passed: true,
+            priority_fee_lamports,
+            slippage_cost_lamports,
+            estimated_net_lamports,
+        };
+
+        append_record_csv(&journal_path, &record)?;
+        return Ok(Vec::new());
+    }
 
     let max_retries = config
         .spam
@@ -90,7 +201,8 @@ pub async fn build_and_send_transaction(
     let mut signatures = Vec::new();
     let mut successful_send = false;
 
-    for (i, client) in rpc_clients.iter().enumerate() {
+    for i in prioritized_rpc_indices(rpc_clients.len()) {
+        let client = &rpc_clients[i];
         if successful_send {
             break;
         }
@@ -102,11 +214,15 @@ pub async fn build_and_send_transaction(
             Err(e) => {
                 let e_str = e.to_string();
                 if is_rate_limit_error(&e_str) {
+                    update_rpc_health(i, false, true);
+                    metrics::inc_rpc_429();
                     warn!(
                         "RPC client {} rate-limited transaction submission (429 Too Many Requests): {}",
                         i, e
                     );
                 } else {
+                    update_rpc_health(i, false, false);
+                    metrics::inc_rpc_send_fail_non_429();
                     error!("Failed to send transaction through RPC client {}: {}", i, e);
                 }
                 continue;
@@ -118,10 +234,34 @@ pub async fn build_and_send_transaction(
             i, signature
         );
         signatures.push(signature);
+        metrics::inc_tx_sent_success();
+        update_rpc_health(i, true, false);
         successful_send = true;
     }
 
+    if signatures.is_empty() {
+        metrics::inc_tx_send_failed();
+        anyhow::bail!("failed to send transaction via all configured RPC clients");
+    }
+
     Ok(signatures)
+}
+
+fn ensure_simulation_passes(client: &RpcClient, tx: &VersionedTransaction) -> anyhow::Result<()> {
+    let simulation = client.simulate_transaction_with_config(
+        tx,
+        RpcSimulateTransactionConfig {
+            sig_verify: false,
+            replace_recent_blockhash: true,
+            ..Default::default()
+        },
+    )?;
+
+    if let Some(err) = simulation.value.err {
+        anyhow::bail!("pre-send simulation failed: {:?}", err);
+    }
+
+    Ok(())
 }
 
 async fn send_transaction_with_retries(
@@ -162,7 +302,7 @@ async fn send_transaction_with_retries(
     }
 }
 
-fn is_rate_limit_error(err: &str) -> bool {
+pub(crate) fn is_rate_limit_error(err: &str) -> bool {
     err.contains("429")
         || err.contains("Too Many Requests")
         || err.contains("rate limit")
@@ -176,7 +316,7 @@ pub fn derive_vault_token_account(program_id: &Pubkey, mint: &Pubkey) -> (Pubkey
 
 // See https://docs.solanamevbot.com/home/onchain-bot/onchain-program for more information
 fn create_swap_instruction(
-    wallet_kp: &Keypair,
+    wallet: Pubkey,
     mint_pool_data: &MintPoolData,
     compute_unit_limit: u64,
     use_flashloan: bool,
@@ -193,7 +333,6 @@ fn create_swap_instruction(
     let sysvar_instructions =
         Pubkey::from_str("Sysvar1nstructions1111111111111111111111111").unwrap();
 
-    let wallet = wallet_kp.pubkey();
     let sol_mint_pubkey = sol_mint();
     let wallet_sol_account = mint_pool_data.wallet_wsol_account;
 
