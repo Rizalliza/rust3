@@ -1,16 +1,17 @@
 use crate::config::Config;
+use crate::metrics;
 use crate::refresh::initialize_pool_data;
+use crate::signer::{LocalKeypairSigner, TransactionSigner};
 use crate::transaction::build_and_send_transaction;
 use anyhow::Context;
 use solana_client::rpc_client::RpcClient;
+use solana_sdk::address_lookup_table::state::AddressLookupTable;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
-use solana_sdk::{
-    address_lookup_table::state::AddressLookupTable, compute_budget::ComputeBudgetInstruction,
-};
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -56,7 +57,10 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
 
     let wallet_kp =
         load_keypair(&config.wallet.private_key).context("Failed to load wallet keypair")?;
-    info!("Wallet loaded: {}", wallet_kp.pubkey());
+    let wallet_signer = Arc::new(LocalKeypairSigner::new(
+        Keypair::from_bytes(&wallet_kp.to_bytes()).context("Failed to clone wallet keypair")?,
+    ));
+    info!("Wallet loaded: {}", wallet_signer.pubkey());
 
     let initial_blockhash = rpc_client.get_latest_blockhash()?;
     let cached_blockhash = Arc::new(Mutex::new(initial_blockhash));
@@ -64,71 +68,101 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
     let refresh_interval = Duration::from_secs(10);
     let blockhash_client = rpc_client.clone();
     let blockhash_cache = cached_blockhash.clone();
+    let should_serialize_submissions = config
+        .execution
+        .as_ref()
+        .and_then(|e| e.serialize_submissions)
+        .unwrap_or(true);
+    let submission_lock = Arc::new(Mutex::new(()));
     tokio::spawn(async move {
         blockhash_refresher(blockhash_client, blockhash_cache, refresh_interval).await;
     });
+    tokio::spawn(async move {
+        metrics::metrics_reporter(Duration::from_secs(30)).await;
+    });
 
     for mint_config in &config.routing.mint_config_list {
-        // Get the mint account info to check owner
-        let mint_owner = rpc_client
-            .get_account(&Pubkey::from_str(&mint_config.mint).unwrap())
-            .unwrap()
-            .owner;
+        let mint_pubkey = Pubkey::from_str(&mint_config.mint).unwrap();
+        let mint_owner = rpc_client.get_account(&mint_pubkey)?.owner;
         let wallet_token_account = get_associated_token_address_with_program_id(
             &wallet_kp.pubkey(),
-            &Pubkey::from_str(&mint_config.mint).unwrap(),
+            &mint_pubkey,
             &mint_owner,
         );
 
         println!("   Token mint: {}", mint_config.mint);
+        println!("   Mint owner program: {}", mint_owner);
         println!("   Wallet token ATA: {}", wallet_token_account);
-        // Check if the PWEASE token account exists and create it if it doesn't
         println!("\n   Checking if token account exists...");
-        loop {
-            match rpc_client.get_account(&wallet_token_account) {
-                Ok(_) => {
-                    println!("   token account exists!");
-                    break;
-                }
-                Err(_) => {
-                    println!("   token account does not exist. Creating it...");
+        if rpc_client.get_account(&wallet_token_account).is_err() {
+            println!("   token account does not exist. Creating it...");
+            let create_ata_ix =
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &wallet_kp.pubkey(),
+                    &wallet_kp.pubkey(),
+                    &mint_pubkey,
+                    &mint_owner,
+                );
 
-                    // Create the instruction to create the associated token account
-                    let create_ata_ix =
-                            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                                &wallet_kp.pubkey(), // Funding account
-                                &wallet_kp.pubkey(), // Wallet account
-                                &Pubkey::from_str(&mint_config.mint).unwrap(),   // Token mint
-                                &spl_token::ID,      // Token program
-                            );
+            let blockhash = rpc_client.get_latest_blockhash()?;
+            let compute_unit_price_ix = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
+            let compute_unit_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(60_000);
 
-                    // Get a recent blockhash
-                    let blockhash = rpc_client.get_latest_blockhash()?;
+            let create_ata_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+                &[compute_unit_price_ix, compute_unit_limit_ix, create_ata_ix],
+                Some(&wallet_kp.pubkey()),
+                &[&wallet_kp],
+                blockhash,
+            );
 
-                    let compute_unit_price_ix =
-                        ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
-                    let compute_unit_limit_ix =
-                        ComputeBudgetInstruction::set_compute_unit_limit(60_000);
+            let sig = rpc_client
+                .send_and_confirm_transaction(&create_ata_tx)
+                .context("Failed to create trade mint ATA")?;
+            println!("   token account created successfully! Signature: {}", sig);
+        } else {
+            println!("   token account exists!");
+        }
+    }
 
-                    // Create the transaction
-                    let create_ata_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
-                        &[compute_unit_price_ix, compute_unit_limit_ix, create_ata_ix],
-                        Some(&wallet_kp.pubkey()),
-                        &[&wallet_kp],
-                        blockhash,
+    let mut base_mints = vec![
+        ("WSOL", crate::constants::sol_mint()),
+        ("USDC", Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap()),
+        ("USD1", Pubkey::from_str("USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB").unwrap()),
+    ];
+
+    for (mint_name, mint) in base_mints.drain(..) {
+        let ata = get_associated_token_address_with_program_id(
+            &wallet_kp.pubkey(),
+            &mint,
+            &spl_token::ID,
+        );
+        info!("Checking {} ATA: {}", mint_name, ata);
+        match rpc_client.get_account(&ata) {
+            Ok(_) => info!("{} ATA already exists", mint_name),
+            Err(_) => {
+                info!("{} ATA does not exist, creating...", mint_name);
+                let create_ata_ix =
+                    spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                        &wallet_kp.pubkey(),
+                        &wallet_kp.pubkey(),
+                        &mint,
+                        &spl_token::ID,
                     );
-
-                    // Send the transaction
-                    match rpc_client.send_and_confirm_transaction(&create_ata_tx) {
-                        Ok(sig) => {
-                            println!("   token account created successfully! Signature: {}", sig);
-                        }
-                        Err(e) => {
-                            println!("   Failed to create token account: {:?}", e);
-                            return Err(anyhow::anyhow!("Failed to create token account"));
-                        }
-                    }
-                }
+                let blockhash = rpc_client.get_latest_blockhash()?;
+                let compute_unit_price_ix =
+                    ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
+                let compute_unit_limit_ix =
+                    ComputeBudgetInstruction::set_compute_unit_limit(60_000);
+                let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+                    &[compute_unit_price_ix, compute_unit_limit_ix, create_ata_ix],
+                    Some(&wallet_kp.pubkey()),
+                    &[&wallet_kp],
+                    blockhash,
+                );
+                let sig = rpc_client
+                    .send_and_confirm_transaction(&tx)
+                    .context(format!("Failed to create {} ATA", mint_name))?;
+                info!("{} ATA created successfully. Signature: {}", mint_name, sig);
             }
         }
     }
@@ -138,7 +172,7 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
 
         let pool_data = initialize_pool_data(
             &mint_config.mint,
-            &wallet_kp.pubkey().to_string(),
+            &wallet_signer.pubkey().to_string(),
             mint_config.raydium_pool_list.as_ref(),
             mint_config.raydium_cp_pool_list.as_ref(),
             mint_config.pump_pool_list.as_ref(),
@@ -155,14 +189,12 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
 
         let mint_pool_data = Arc::new(Mutex::new(pool_data));
 
-        // TODO: Add logic to periodically refresh pool data
-
         let config_clone = config.clone();
         let mint_config_clone = mint_config.clone();
         let sending_rpc_clients_clone = sending_rpc_clients.clone();
         let cached_blockhash_clone = cached_blockhash.clone();
-        let wallet_bytes = wallet_kp.to_bytes();
-        let wallet_kp_clone = Keypair::from_bytes(&wallet_bytes).unwrap();
+        let submission_lock_clone = submission_lock.clone();
+        let wallet_signer_clone = wallet_signer.clone();
         let mut lookup_table_accounts = mint_config_clone.lookup_table_accounts.unwrap_or_default();
         lookup_table_accounts.push("4sKLJ1Qoudh8PJyqBeuKocYdsZvxTcRShUt9aKqwhgvC".to_string());
 
@@ -183,17 +215,14 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
                                     info!("   Successfully loaded lookup table: {}", pubkey);
                                 }
                                 Err(e) => {
-                                    error!(
-                                        "   Failed to deserialize lookup table {}: {}",
-                                        pubkey, e
-                                    );
-                                    continue; // Skip this lookup table but continue processing others
+                                    error!("   Failed to deserialize lookup table {}: {}", pubkey, e);
+                                    continue;
                                 }
                             }
                         }
                         Err(e) => {
                             error!("   Failed to fetch lookup table account {}: {}", pubkey, e);
-                            continue; // Skip this lookup table but continue processing others
+                            continue;
                         }
                     }
                 }
@@ -202,7 +231,7 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
                         "   Invalid lookup table pubkey string {}: {}",
                         lookup_table_account, e
                     );
-                    continue; // Skip this lookup table but continue processing others
+                    continue;
                 }
             }
         }
@@ -220,9 +249,28 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
             let mut last_submission_blockhash = Hash::default();
             let mut submitted_once = false;
             let mut rate_limit_streak = 0u32;
+            let startup_jitter_ms = config_clone
+                .spam
+                .as_ref()
+                .and_then(|s| s.worker_startup_jitter_ms)
+                .unwrap_or(500);
+            let rate_limit_cooldown_base_ms = config_clone
+                .spam
+                .as_ref()
+                .and_then(|s| s.rate_limit_cooldown_base_ms)
+                .unwrap_or(250);
+            let rate_limit_cooldown_max_ms = config_clone
+                .spam
+                .as_ref()
+                .and_then(|s| s.rate_limit_cooldown_max_ms)
+                .unwrap_or(8000);
 
-            // Prevent all mint workers from submitting in lock-step, which can trigger burst 429s.
-            tokio::time::sleep(Duration::from_millis(rand::random::<u64>() % 500)).await;
+            if startup_jitter_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(
+                    rand::random::<u64>() % startup_jitter_ms,
+                ))
+                .await;
+            }
 
             loop {
                 let latest_blockhash = {
@@ -237,23 +285,44 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
 
                 let guard = mint_pool_data.lock().await;
 
-                match build_and_send_transaction(
-                    &wallet_kp_clone,
-                    &config_clone,
-                    &*guard, // Dereference the guard here
-                    &sending_rpc_clients_clone,
-                    latest_blockhash,
-                    &lookup_table_accounts_list,
-                )
-                .await
-                {
+                let result = if should_serialize_submissions {
+                    let _submit_guard = submission_lock_clone.lock().await;
+                    build_and_send_transaction(
+                        wallet_signer_clone.as_ref(),
+                        &config_clone,
+                        &*guard,
+                        &sending_rpc_clients_clone,
+                        latest_blockhash,
+                        &lookup_table_accounts_list,
+                    )
+                    .await
+                } else {
+                    build_and_send_transaction(
+                        wallet_signer_clone.as_ref(),
+                        &config_clone,
+                        &*guard,
+                        &sending_rpc_clients_clone,
+                        latest_blockhash,
+                        &lookup_table_accounts_list,
+                    )
+                    .await
+                };
+
+                match result {
                     Ok(signatures) => {
                         info!(
                             "Transactions sent successfully for mint {}",
                             mint_config_clone.mint
                         );
-                        for signature in signatures {
-                            info!("  Signature: {}", signature);
+                        if signatures.is_empty() {
+                            info!(
+                                "Paper-trading mode active: no transaction broadcast for mint {}",
+                                mint_config_clone.mint
+                            );
+                        } else {
+                            for signature in signatures {
+                                info!("  Signature: {}", signature);
+                            }
                         }
                         submitted_once = true;
                         last_submission_blockhash = latest_blockhash;
@@ -267,12 +336,14 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
 
                         if crate::transaction::is_rate_limit_error(&e.to_string()) {
                             rate_limit_streak = rate_limit_streak.saturating_add(1);
-                            let cooldown_ms = 250u64
-                                .saturating_mul(2u64.saturating_pow(rate_limit_streak.min(4)));
+                            let cooldown_ms = rate_limit_cooldown_base_ms
+                                .saturating_mul(2u64.saturating_pow(rate_limit_streak.min(4)))
+                                .min(rate_limit_cooldown_max_ms);
                             warn!(
                                 "Mint {} hit RPC 429 rate limits (streak {}). Cooling down for {}ms",
                                 mint_config_clone.mint, rate_limit_streak, cooldown_ms
                             );
+                            metrics::inc_cooldown_events();
                             tokio::time::sleep(Duration::from_millis(cooldown_ms)).await;
                         } else {
                             rate_limit_streak = 0;
@@ -327,3 +398,13 @@ fn load_keypair(private_key: &str) -> anyhow::Result<Keypair> {
 
     anyhow::bail!("Failed to load keypair from: {}", private_key)
 }
+/*
+git status
+git stash -u              # only if you have local uncommitted changes
+git fetch origin
+git checkout main
+git pull --ff-only
+cargo check
+cargo run --release
+
+*/

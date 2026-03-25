@@ -24,6 +24,22 @@ process_delay = 400
 # RPC URL for the Solana network
 url = "https://api.mainnet-beta.solana.com"
 
+[execution]
+# Run local RPC simulation before submitting transactions
+require_simulation_success = true
+# Serialize submissions across mint workers to reduce burst contention
+serialize_submissions = true
+
+[paper_trading]
+# Enable dry-run paper trading mode (simulates and journals, but does not broadcast)
+enabled = false
+# CSV output path for paper trading records
+journal_path = "paper_trades.csv"
+# Notional used for slippage cost estimation
+assumed_notional_lamports = 1000000
+# Slippage assumption (bps) used in estimated PnL
+assumed_slippage_bps = 50
+
 [spam]
 # Enable spam transactions
 enabled = true
@@ -35,11 +51,17 @@ sending_rpc_urls = [
 compute_unit_price = 1000
 # Maximum retries
 max_retries = 3
+# Optional startup jitter (ms) to de-sync mint workers and avoid RPC bursts
+worker_startup_jitter_ms = 500
+# Optional base cooldown (ms) after 429 errors (uses exponential backoff)
+rate_limit_cooldown_base_ms = 250
+# Optional max cooldown cap (ms) for repeated 429s
+rate_limit_cooldown_max_ms = 8000
 
 [wallet]
 # Private key (can be path or environment variable)
 private_key = ""
 
-[kamino_flashloan]
+[flashloan]
 # Enable Kamino flashloan
 enabled = true

@@ -6,6 +6,8 @@ pub struct Config {
     pub bot: BotConfig,
     pub routing: RoutingConfig,
     pub rpc: RpcConfig,
+    pub execution: Option<ExecutionConfig>,
+    pub paper_trading: Option<PaperTradingConfig>,
     pub spam: Option<SpamConfig>,
     pub wallet: WalletConfig,
     pub flashloan: Option<FlashloanConfig>,
@@ -43,6 +45,7 @@ pub struct MintConfig {
 
     pub lookup_table_accounts: Option<Vec<String>>,
     pub process_delay: u64,
+    pub validate_pools: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -57,6 +60,23 @@ pub struct SpamConfig {
     pub sending_rpc_urls: Vec<String>,
     pub compute_unit_price: u64,
     pub max_retries: Option<u64>,
+    pub worker_startup_jitter_ms: Option<u64>,
+    pub rate_limit_cooldown_base_ms: Option<u64>,
+    pub rate_limit_cooldown_max_ms: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct ExecutionConfig {
+    pub require_simulation_success: Option<bool>,
+    pub serialize_submissions: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct PaperTradingConfig {
+    pub enabled: bool,
+    pub journal_path: Option<String>,
+    pub assumed_notional_lamports: Option<u64>,
+    pub assumed_slippage_bps: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
