@@ -131,6 +131,68 @@ pub async fn build_and_send_transaction(
 
     let tx = signer.sign_versioned_message(solana_sdk::message::VersionedMessage::V0(message))?;
 
+    let require_simulation_success = config
+        .execution
+        .as_ref()
+        .and_then(|e| e.require_simulation_success)
+        .unwrap_or(true);
+    let paper_trading_enabled = config
+        .paper_trading
+        .as_ref()
+        .map(|p| p.enabled)
+        .unwrap_or(false);
+
+    if require_simulation_success {
+        let simulation_client = rpc_clients
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no RPC clients configured for simulation"))?;
+        if let Err(err) = ensure_simulation_passes(simulation_client, &tx) {
+            metrics::inc_tx_sim_failed();
+            metrics::inc_tx_send_failed();
+            return Err(err);
+        }
+        metrics::inc_tx_sim_ok();
+    }
+
+    if paper_trading_enabled {
+        let compute_unit_price = config.spam.as_ref().map_or(1000, |s| s.compute_unit_price);
+        let priority_fee_lamports =
+            (compute_unit_limit as u64).saturating_mul(compute_unit_price) / 1_000_000;
+        let assumed_notional_lamports = config
+            .paper_trading
+            .as_ref()
+            .and_then(|p| p.assumed_notional_lamports)
+            .unwrap_or(1_000_000);
+        let assumed_slippage_bps = config
+            .paper_trading
+            .as_ref()
+            .and_then(|p| p.assumed_slippage_bps)
+            .unwrap_or(50);
+        let slippage_cost_lamports =
+            assumed_notional_lamports.saturating_mul(assumed_slippage_bps) / 10_000;
+        let estimated_net_lamports =
+            -((priority_fee_lamports.saturating_add(slippage_cost_lamports)) as i64);
+        let journal_path = config
+            .paper_trading
+            .as_ref()
+            .and_then(|p| p.journal_path.clone())
+            .unwrap_or_else(|| "paper_trades.csv".to_string());
+
+        let record = PaperTradeRecord {
+            timestamp_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default(),
+            mint: mint_pool_data.mint.to_string(),
+            simulation_passed: true,
+            priority_fee_lamports,
+            slippage_cost_lamports,
+            estimated_net_lamports,
+        };
+
+        append_record_csv(&journal_path, &record)?;
+        return Ok(Vec::new());
+    }
     validate_wallet_accounts(
         rpc_clients.first().ok_or_else(|| anyhow::anyhow!("no RPC clients configured"))?,
         signer.pubkey(),
@@ -270,6 +332,7 @@ fn ensure_simulation_passes(client: &RpcClient, tx: &VersionedTransaction) -> an
         },
     )?;
 
+    if let Some(err) = simulation.value.err {
     if let Some(logs) = simulation.value.logs.as_ref() {
         println!("--- simulation logs ---");
         for l in logs {

@@ -11,6 +11,9 @@ use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
 use solana_sdk::signature::Keypair;
 use solana_sdk::signer::Signer;
+use solana_sdk::{
+    address_lookup_table::state::AddressLookupTable, compute_budget::ComputeBudgetInstruction,
+};
 use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::HashSet;
@@ -265,6 +268,7 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
                 .and_then(|s| s.rate_limit_cooldown_max_ms)
                 .unwrap_or(8000);
 
+            // Prevent all mint workers from submitting in lock-step, which can trigger burst 429s.
             if startup_jitter_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(
                     rand::random::<u64>() % startup_jitter_ms,
@@ -290,6 +294,7 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
                     build_and_send_transaction(
                         wallet_signer_clone.as_ref(),
                         &config_clone,
+                        &*guard, // Dereference the guard here
                         &*guard,
                         &sending_rpc_clients_clone,
                         latest_blockhash,
@@ -300,6 +305,7 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
                     build_and_send_transaction(
                         wallet_signer_clone.as_ref(),
                         &config_clone,
+                        &*guard, // Dereference the guard here
                         &*guard,
                         &sending_rpc_clients_clone,
                         latest_blockhash,
