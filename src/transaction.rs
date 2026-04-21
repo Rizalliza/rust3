@@ -16,6 +16,7 @@ use solana_sdk::hash::Hash;
 use solana_sdk::message::v0::Message;
 use solana_sdk::signature::Signature;
 use solana_sdk::transaction::VersionedTransaction;
+use solana_sdk::{instruction::Instruction as SolanaInstruction, program_pack::Pack, signature::Signer, transaction::Transaction};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
@@ -34,6 +35,7 @@ use crate::dex::whirlpool::constants::whirlpool_program_id;
 use solana_program::instruction::AccountMeta;
 use solana_program::pubkey::Pubkey;
 use solana_program::system_program;
+use spl_token::state::Account as TokenAccount;
 use spl_associated_token_account::ID as associated_token_program_id;
 use spl_token::ID as token_program_id;
 use std::str::FromStr;
@@ -95,7 +97,7 @@ pub async fn build_and_send_transaction(
 ) -> anyhow::Result<Vec<Signature>> {
     metrics::inc_tx_attempted();
     let enable_flashloan = config.flashloan.as_ref().map_or(false, |k| k.enabled);
-    let compute_unit_limit = config.bot.compute_unit_limit;
+    let compute_unit_limit = config.bot.compute_unit_limit.max(250_000).min(600_000);
     let mut instructions = vec![];
     // Add a random number here to make each transaction unique
     let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(
@@ -128,6 +130,79 @@ pub async fn build_and_send_transaction(
     )?;
 
     let tx = signer.sign_versioned_message(solana_sdk::message::VersionedMessage::V0(message))?;
+
+    let require_simulation_success = config
+        .execution
+        .as_ref()
+        .and_then(|e| e.require_simulation_success)
+        .unwrap_or(true);
+    let paper_trading_enabled = config
+        .paper_trading
+        .as_ref()
+        .map(|p| p.enabled)
+        .unwrap_or(false);
+
+    if require_simulation_success {
+        let simulation_client = rpc_clients
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no RPC clients configured for simulation"))?;
+        if let Err(err) = ensure_simulation_passes(simulation_client, &tx) {
+            metrics::inc_tx_sim_failed();
+            metrics::inc_tx_send_failed();
+            return Err(err);
+        }
+        metrics::inc_tx_sim_ok();
+    }
+
+    if paper_trading_enabled {
+        let compute_unit_price = config.spam.as_ref().map_or(1000, |s| s.compute_unit_price);
+        let priority_fee_lamports =
+            (compute_unit_limit as u64).saturating_mul(compute_unit_price) / 1_000_000;
+        let assumed_notional_lamports = config
+            .paper_trading
+            .as_ref()
+            .and_then(|p| p.assumed_notional_lamports)
+            .unwrap_or(1_000_000);
+        let assumed_slippage_bps = config
+            .paper_trading
+            .as_ref()
+            .and_then(|p| p.assumed_slippage_bps)
+            .unwrap_or(50);
+        let slippage_cost_lamports =
+            assumed_notional_lamports.saturating_mul(assumed_slippage_bps) / 10_000;
+        let estimated_net_lamports =
+            -((priority_fee_lamports.saturating_add(slippage_cost_lamports)) as i64);
+        let journal_path = config
+            .paper_trading
+            .as_ref()
+            .and_then(|p| p.journal_path.clone())
+            .unwrap_or_else(|| "paper_trades.csv".to_string());
+
+        let record = PaperTradeRecord {
+            timestamp_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or_default(),
+            mint: mint_pool_data.mint.to_string(),
+            simulation_passed: true,
+            priority_fee_lamports,
+            slippage_cost_lamports,
+            estimated_net_lamports,
+        };
+
+        append_record_csv(&journal_path, &record)?;
+        return Ok(Vec::new());
+    }
+    validate_wallet_accounts(
+        rpc_clients.first().ok_or_else(|| anyhow::anyhow!("no RPC clients configured"))?,
+        signer.pubkey(),
+        mint_pool_data,
+    )?;
+    log_all_account_metadata(
+        rpc_clients.first().ok_or_else(|| anyhow::anyhow!("no RPC clients configured"))?,
+        signer.pubkey(),
+        mint_pool_data,
+    )?;
 
     let require_simulation_success = config
         .execution
@@ -258,6 +333,37 @@ fn ensure_simulation_passes(client: &RpcClient, tx: &VersionedTransaction) -> an
     )?;
 
     if let Some(err) = simulation.value.err {
+    if let Some(logs) = simulation.value.logs.as_ref() {
+        println!("--- simulation logs ---");
+        for l in logs {
+            println!("{}", l);
+        }
+        println!("--- end simulation logs ---");
+    }
+
+    if let Some(err) = simulation.value.err {
+        if let Some(accounts) = simulation.value.accounts.as_ref() {
+            println!("--- simulation account states ---");
+            for (i, account) in accounts.iter().enumerate() {
+                match account {
+                    Some(account) => {
+                        println!(
+                            "account[{}]: lamports={} owner={} executable={} rent_epoch={}",
+                            i,
+                            account.lamports,
+                            account.owner,
+                            account.executable,
+                            account.rent_epoch
+                        );
+                    }
+                    None => {
+                        println!("account[{}]: <none>", i);
+                    }
+                }
+            }
+            println!("--- end simulation account states ---");
+        }
+
         anyhow::bail!("pre-send simulation failed: {:?}", err);
     }
 
@@ -335,11 +441,17 @@ fn create_swap_instruction(
 
     let sol_mint_pubkey = sol_mint();
     let wallet_sol_account = mint_pool_data.wallet_wsol_account;
+    let wallet_x_account =
+        spl_associated_token_account::get_associated_token_address_with_program_id(
+            &wallet,
+            &mint_pool_data.mint,
+            &mint_pool_data.token_program,
+        );
 
     let mut accounts = vec![
         AccountMeta::new_readonly(wallet, true), // 0. Wallet (signer)
         AccountMeta::new_readonly(sol_mint_pubkey, false), // 1. SOL mint
-        AccountMeta::new(fee_collector, false),  // 2. Fee collector
+        AccountMeta::new(fee_collector, false), // 2. Fee collector
         AccountMeta::new(wallet_sol_account, false), // 3. Wallet SOL account
         AccountMeta::new_readonly(token_program_id, false), // 4. Token program
         AccountMeta::new_readonly(system_program::ID, false), // 5. System program
@@ -365,13 +477,13 @@ fn create_swap_instruction(
         mint_pool_data.token_program,
         false,
     )); // Token program (SPL Token or Token 2022)
-    let wallet_x_account =
-        spl_associated_token_account::get_associated_token_address_with_program_id(
-            &wallet,
-            &mint_pool_data.mint,
-            &mint_pool_data.token_program,
-        );
     accounts.push(AccountMeta::new(wallet_x_account, false));
+    debug!(
+        "Wallet mint ATA for {} is {} (token program: {})",
+        mint_pool_data.mint,
+        wallet_x_account,
+        mint_pool_data.token_program
+    );
 
     for pool in &mint_pool_data.raydium_pools {
         accounts.push(AccountMeta::new_readonly(raydium_program_id(), false));
@@ -493,7 +605,25 @@ fn create_swap_instruction(
         accounts.push(AccountMeta::new(pool.token_sol_vault, false));
     }
 
-    let mut data = vec![26u8];
+    info!("Executor account list ({} accounts):", accounts.len());
+    for (i, acc) in accounts.iter().enumerate() {
+        println!("{}: {}", i, acc.pubkey);
+        info!(
+            "  [{}] pubkey={} signer={} writable={}",
+            i,
+            acc.pubkey,
+            acc.is_signer,
+            acc.is_writable
+        );
+    }
+
+    if let Err(err) =
+        debug_validate_accounts(&accounts, &mint_pool_data.mint, &mint_pool_data.token_program)
+    {
+        warn!("account validation warning: {}", err);
+    }
+
+    let mut data = vec![28u8];
 
     let minimum_profit: u64 = 0;
     // When true, the bot will not fail the transaction even when it can't find a profitable arbitrage. It will just do nothing and succeed.
@@ -510,4 +640,215 @@ fn create_swap_instruction(
         accounts,
         data,
     })
+}
+
+fn debug_validate_accounts(
+    accounts: &[AccountMeta],
+    mint: &Pubkey,
+    token_program: &Pubkey,
+) -> anyhow::Result<()> {
+    let wallet_x_account = spl_associated_token_account::get_associated_token_address_with_program_id(
+        &accounts[0].pubkey,
+        mint,
+        token_program,
+    );
+    info!(
+        "debug validation: mint={} token_program={} derived_wallet_ata={}",
+        mint,
+        token_program,
+        wallet_x_account
+    );
+    for (i, acc) in accounts.iter().enumerate() {
+        info!("debug validation account[{}]={}", i, acc.pubkey);
+    }
+    Ok(())
+}
+
+fn validate_wallet_accounts(
+    rpc: &RpcClient,
+    wallet: Pubkey,
+    mint_pool_data: &MintPoolData,
+) -> anyhow::Result<()> {
+    let wsol = mint_pool_data.wallet_wsol_account;
+    let mint = mint_pool_data.mint;
+    let token_program = mint_pool_data.token_program;
+    let ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+        &wallet,
+        &mint,
+        &token_program,
+    );
+
+    for (label, pubkey, expected_mint) in [
+        ("wallet_sol_account", wsol, sol_mint()),
+        ("derived_wallet_ata", ata, mint),
+    ] {
+        let account = rpc
+            .get_account(&pubkey)
+            .map_err(|e| anyhow::anyhow!("{} {} missing: {}", label, pubkey, e))?;
+
+        info!(
+            "validated {}={} owner={} lamports={} data_len={}",
+            label,
+            pubkey,
+            account.owner,
+            account.lamports,
+            account.data.len()
+        );
+
+        if account.owner != token_program {
+            anyhow::bail!(
+                "{} {} has wrong owner {} (expected token program {})",
+                label,
+                pubkey,
+                account.owner,
+                token_program
+            );
+        }
+
+        let token_account = TokenAccount::unpack(&account.data)
+            .map_err(|e| anyhow::anyhow!("{} {} is not a valid token account: {}", label, pubkey, e))?;
+
+        if token_account.mint != expected_mint {
+            anyhow::bail!(
+                "{} {} has wrong mint {} (expected {})",
+                label,
+                pubkey,
+                token_account.mint,
+                expected_mint
+            );
+        }
+    }
+
+    Ok(())
+}
+
+fn log_all_account_metadata(
+    rpc: &RpcClient,
+    wallet: Pubkey,
+    mint_pool_data: &MintPoolData,
+) -> anyhow::Result<()> {
+    let mut accounts = vec![
+        ("wallet", wallet),
+        ("wallet_sol_account", mint_pool_data.wallet_wsol_account),
+        (
+            "derived_wallet_ata",
+            spl_associated_token_account::get_associated_token_address_with_program_id(
+                &wallet,
+                &mint_pool_data.mint,
+                &mint_pool_data.token_program,
+            ),
+        ),
+        ("mint", mint_pool_data.mint),
+        ("token_program", mint_pool_data.token_program),
+    ];
+
+    for pool in &mint_pool_data.raydium_pools {
+        accounts.push(("raydium_pool", pool.pool));
+        accounts.push(("raydium_token_vault", pool.token_vault));
+        accounts.push(("raydium_sol_vault", pool.sol_vault));
+    }
+
+    for pool in &mint_pool_data.raydium_cp_pools {
+        accounts.push(("raydium_cp_pool", pool.pool));
+        accounts.push(("raydium_cp_amm_config", pool.amm_config));
+        accounts.push(("raydium_cp_token_vault", pool.token_vault));
+        accounts.push(("raydium_cp_sol_vault", pool.sol_vault));
+        accounts.push(("raydium_cp_observation", pool.observation));
+    }
+
+    for pool in &mint_pool_data.pump_pools {
+        accounts.push(("pump_pool", pool.pool));
+        accounts.push(("pump_token_vault", pool.token_vault));
+        accounts.push(("pump_sol_vault", pool.sol_vault));
+        accounts.push(("pump_fee_token_wallet", pool.fee_token_wallet));
+        accounts.push(("pump_coin_creator_vault_ata", pool.coin_creator_vault_ata));
+        accounts.push(("pump_coin_creator_vault_authority", pool.coin_creator_vault_authority));
+    }
+
+    for pair in &mint_pool_data.dlmm_pairs {
+        accounts.push(("dlmm_pair", pair.pair));
+        accounts.push(("dlmm_token_vault", pair.token_vault));
+        accounts.push(("dlmm_sol_vault", pair.sol_vault));
+        accounts.push(("dlmm_oracle", pair.oracle));
+        for bin in &pair.bin_arrays {
+            accounts.push(("dlmm_bin_array", *bin));
+        }
+    }
+
+    for pool in &mint_pool_data.whirlpool_pools {
+        accounts.push(("whirlpool_pool", pool.pool));
+        accounts.push(("whirlpool_oracle", pool.oracle));
+        accounts.push(("whirlpool_x_vault", pool.x_vault));
+        accounts.push(("whirlpool_y_vault", pool.y_vault));
+        for tick in &pool.tick_arrays {
+            accounts.push(("whirlpool_tick_array", *tick));
+        }
+    }
+
+    for pool in &mint_pool_data.raydium_clmm_pools {
+        accounts.push(("raydium_clmm_pool", pool.pool));
+        accounts.push(("raydium_clmm_amm_config", pool.amm_config));
+        accounts.push(("raydium_clmm_observation_state", pool.observation_state));
+        accounts.push(("raydium_clmm_bitmap_extension", pool.bitmap_extension));
+        accounts.push(("raydium_clmm_x_vault", pool.x_vault));
+        accounts.push(("raydium_clmm_y_vault", pool.y_vault));
+        for tick in &pool.tick_arrays {
+            accounts.push(("raydium_clmm_tick_array", *tick));
+        }
+    }
+
+    for pool in &mint_pool_data.meteora_damm_pools {
+        accounts.push(("meteora_damm_pool", pool.pool));
+        accounts.push(("meteora_damm_token_x_vault", pool.token_x_vault));
+        accounts.push(("meteora_damm_token_sol_vault", pool.token_sol_vault));
+        accounts.push(("meteora_damm_token_x_token_vault", pool.token_x_token_vault));
+        accounts.push(("meteora_damm_token_sol_token_vault", pool.token_sol_token_vault));
+        accounts.push(("meteora_damm_token_x_lp_mint", pool.token_x_lp_mint));
+        accounts.push(("meteora_damm_token_sol_lp_mint", pool.token_sol_lp_mint));
+        accounts.push(("meteora_damm_token_x_pool_lp", pool.token_x_pool_lp));
+        accounts.push(("meteora_damm_token_sol_pool_lp", pool.token_sol_pool_lp));
+        accounts.push(("meteora_damm_admin_token_fee_x", pool.admin_token_fee_x));
+        accounts.push(("meteora_damm_admin_token_fee_sol", pool.admin_token_fee_sol));
+    }
+
+    for pool in &mint_pool_data.meteora_damm_v2_pools {
+        accounts.push(("meteora_damm_v2_pool", pool.pool));
+        accounts.push(("meteora_damm_v2_token_x_vault", pool.token_x_vault));
+        accounts.push(("meteora_damm_v2_token_sol_vault", pool.token_sol_vault));
+    }
+
+    for pool in &mint_pool_data.solfi_pools {
+        accounts.push(("solfi_pool", pool.pool));
+        accounts.push(("solfi_token_x_vault", pool.token_x_vault));
+        accounts.push(("solfi_token_sol_vault", pool.token_sol_vault));
+    }
+
+    for pool in &mint_pool_data.vertigo_pools {
+        accounts.push(("vertigo_pool", pool.pool));
+        accounts.push(("vertigo_pool_owner", pool.pool_owner));
+        accounts.push(("vertigo_token_x_vault", pool.token_x_vault));
+        accounts.push(("vertigo_token_sol_vault", pool.token_sol_vault));
+    }
+
+    println!("--- account ownership diagnostics ---");
+    for (label, pubkey) in accounts {
+        match rpc.get_account(&pubkey) {
+            Ok(account) => {
+                println!(
+                    "[{}] {} owner={} data_len={} executable={}",
+                    label,
+                    pubkey,
+                    account.owner,
+                    account.data.len(),
+                    account.executable
+                );
+            }
+            Err(_) => {
+                println!("[{}] {} MISSING", label, pubkey);
+            }
+        }
+    }
+    println!("--- end account ownership diagnostics ---");
+
+    Ok(())
 }

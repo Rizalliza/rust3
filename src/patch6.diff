@@ -1,0 +1,19 @@
+ (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
+diff --git a/src/lib.rs b/src/lib.rs
+index 9c8ab6ae2fa70391f0bc4d32cdd6773ccc065da9..13ff86460850a6184055300a1830debe020d6bc1 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,7 +1,10 @@
+ pub mod bot;
+ pub mod config;
+ pub mod constants;
+ pub mod dex;
++pub mod metrics;
++pub mod paper_trading;
+ pub mod pools;
+ pub mod refresh;
++pub mod signer;
+ pub mod transaction;
+ 
+EOF
+)

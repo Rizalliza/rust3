@@ -1,0 +1,222 @@
+What is still required for production + profitability?
+1) Strategy correctness (highest priority)
+Add a strict expected net PnL gate per opportunity:
+
+gross arb edge
+
+all swap fees
+
+priority fee + Jito tip
+
+expected slippage
+
+failure probability cost
+
+Require positive EV with safety margin (not just nominal spread).
+
+2) State freshness and simulation quality
+Implement continuous pool/account refresh (currently TODO).
+
+Add deterministic pre-send simulation with current slot state (or recent blockhash state + account cache).
+
+Reject opportunities if key accounts changed since quote.
+
+3) Execution reliability
+Multi-provider quorum RPC + health scoring (latency/error/429 aware).
+
+Add adaptive per-provider rate budgets and circuit breakers.
+
+Explicit handling when build_and_send_transaction returns empty signatures (currently possible).
+
+4) MEV / inclusion strategy
+Integrate private orderflow (e.g., bundles) and dynamic bidding for inclusion.
+
+Separate “must-land” and “optional” orders with different fee/tip policies.
+
+Add re-broadcast policy by slot and blockhash expiry.
+
+5) Risk management (must-have before real capital)
+Per-trade max loss, per-token exposure cap, daily drawdown guard.
+
+Kill-switch on consecutive failed fills/reverts.
+
+Balance/ATA sanity checks, min-liquidity filters, toxic pool denylist.
+
+6) Observability + operations
+Persistent trade journal: quote, sim result, sent tx sig, landed slot, realized PnL.
+
+Prometheus/Grafana (README mentions metrics endpoint, but make sure implemented and complete in runtime).
+
+Alerting: 429 spikes, fail rate, stale data age, no-opportunities anomalies.
+
+7) Security / key management
+Move hot key handling to hardened signer process/HSM flow.
+
+No plain path private key in prod config; use env/secret manager and isolated signer process.
+
+8) Economic validation before go-live
+Full paper-trading with realistic inclusion/slippage model.
+
+Canary with tiny size and strict stop conditions.
+
+Only scale after statistically significant positive realized PnL net of all costs.
+
+Practical “go-live ladder” (recommended)
+Devnet/local replay: correctness and crash safety.
+
+Mainnet shadow mode: quote/sim/send-intent without signing.
+
+Micro-size canary: tiny notional, strict kill-switch.
+
+Gradual scaling by pair after pair-level profitability proof.
+
+Commands I used to assess this
+sed -n '1,260p' src/bot.rs; sed -n '1,260p' src/transaction.rs; sed -n '1,260p' src/refresh.rs; sed -n '1,260p' src/pools.rs; sed -n '1,260p' README.md
+
+nl -ba src/config.rs | sed -n '1,220p'; nl -ba README.md | sed -n '1,260p'; nl -ba src/bot.rs | sed -n '130,240p'; nl -ba src/transaction.rs | sed -n '1,220p'
+
+nl -ba config.toml | sed -n '1,120p'; nl -ba src/main.rs | sed -n '1,120p'
+
+If you want, next I can give you a concrete production roadmap in phases (Week 1–4) with exact code modules to add first so you can reach profitable canary trading faster.
+
+yes please
+Copy
+Awesome — here’s a concrete 4-week production roadmap tailored to this codebase.
+
+Phase 0 (Day 0–1): Stabilize config + wiring
+Fix config schema mismatch
+
+Rename [kamino_flashloan] → [flashloan] in config so it actually maps to Config.flashloan.
+
+Split read RPC vs send RPC configs
+
+Keep one low-latency read client and a pool of send clients (already partially modeled by rpc.url vs spam.sending_rpc_urls).
+
+Add explicit rate-limit knobs
+
+Add config for per-worker min send interval, global send QPS cap, and cooldown ceiling (instead of hardcoded values).
+
+Phase 1 (Week 1): Make decisions correct before sending
+Add a real opportunity engine
+
+Create src/opportunity.rs to compute candidate routes + expected output.
+
+Add net-profit gate before tx build
+
+Do not call build_and_send_transaction unless:
+
+edge > fees + slippage + priority fee + tip + risk buffer.
+
+Right now the runtime path loops and sends without explicit net-PnL validation in this path.
+
+Add pre-send simulation layer
+
+New module src/simulation.rs that simulates candidate tx and rejects on failure/low edge.
+
+Exit criteria
+
+95% of sent txs pass simulation precheck.
+
+0 sends when expected net PnL ≤ 0.
+
+Phase 2 (Week 2): Fix stale-state + refresh loop
+Implement pool refresh worker
+
+Replace the TODO with periodic updates of pool-dependent data and derived accounts.
+
+Slot-aware invalidation
+
+If pool/account state changes between quote and send, invalidate the opportunity.
+
+Latency budget tracking
+
+Record quote_slot, send_slot, and landed_slot.
+
+Exit criteria
+
+Median quote→send latency within target.
+
+No trades executed on stale snapshots beyond threshold.
+
+Phase 3 (Week 3): Execution reliability + anti-429 architecture
+Central send scheduler
+
+Instead of every mint worker independently submitting, enqueue send jobs into one scheduler.
+
+Per-provider token bucket
+
+Enforce RPC-specific QPS and burst limits.
+
+Provider health scoring
+
+Route sends by health (429 rate, latency, success ratio).
+
+Handle empty signature list as hard failure
+
+build_and_send_transaction currently can return Ok(vec![]); treat this explicitly as failure upstream.
+
+Exit criteria
+
+429 error rate reduced materially.
+
+Submission success rate stable during peak periods.
+
+Phase 4 (Week 4): Profitability + production ops
+Trade journal + PnL attribution
+
+Persist: predicted pnl, realized pnl, fees, slippage, inclusion delay.
+
+Risk framework
+
+Per-token notional caps, max daily drawdown, consecutive-loss kill switch.
+
+Observability
+
+Add Prometheus metrics for opportunity count, simulated pass rate, landed success, realized edge.
+
+README claims metrics endpoint; align runtime implementation with that promise.
+
+Canary deployment
+
+Start with tiny size and auto-disable on threshold breaches.
+
+Exit criteria
+
+Positive realized net PnL over statistically meaningful sample.
+
+No uncontrolled loss events.
+
+Suggested file/module plan (exactly where to build)
+Keep orchestration in src/bot.rs (workers + scheduling).
+
+Keep tx assembly/sending in src/transaction.rs, but only after gate passes.
+
+Use/extend src/refresh.rs for live pool/account refresh lifecycle.
+
+Add:
+
+src/opportunity.rs
+
+src/simulation.rs
+
+src/risk.rs
+
+src/metrics.rs
+
+src/scheduler.rs
+
+Immediate next 3 tasks I recommend you do first
+Fix flashloan config key mismatch and add validation at startup (fail fast if unknown sections).
+
+Add a strict net-profit gate before any send call path.
+
+Implement pool refresh loop where the TODO currently is.
+
+Commands used for this roadmap context
+sed -n '1,260p' src/bot.rs; sed -n '1,260p' src/transaction.rs; sed -n '1,260p' src/refresh.rs; sed -n '1,260p' src/pools.rs; sed -n '1,260p' README.md
+
+nl -ba src/config.rs | sed -n '1,220p'; nl -ba README.md | sed -n '1,260p'; nl -ba src/bot.rs | sed -n '130,240p'; nl -ba src/transaction.rs | sed -n '1,220p'
+
+nl -ba config.toml | sed -n '1,120p'; nl -ba src/main.rs | sed -n '1,120p'
+
+If you want, I can now turn this into a checklist issue template and then implement Phase 1 Task #1 (opportunity + net-profit gate) directly.

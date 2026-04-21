@@ -19,7 +19,7 @@ use solana_program::pubkey::Pubkey;
 use spl_associated_token_account;
 use std::str::FromStr;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub async fn initialize_pool_data(
     mint: &str,
@@ -64,13 +64,13 @@ pub async fn initialize_pool_data(
             match rpc_client.get_account(&pump_pool_pubkey) {
                 Ok(account) => {
                     if account.owner != pump_program_id() {
-                        error!(
-                            "Error: Pump pool account is not owned by the Pump program. Expected: {}, Actual: {}",
-                            pump_program_id(), account.owner
+                        warn!(
+                            "Skipping Pump pool {}: wrong owner {}, expected {}",
+                            pump_pool_pubkey,
+                            account.owner,
+                            pump_program_id()
                         );
-                        return Err(anyhow::anyhow!(
-                            "Pump pool account is not owned by the Pump program"
-                        ));
+                        continue;
                     }
 
                     match PumpAmmInfo::load_checked(&account.data) {
@@ -103,6 +103,17 @@ pub async fn initialize_pool_data(
                                     &amm_info.coin_creator_vault_authority,
                                     &amm_info.quote_mint,
                                 );
+
+                            if rpc_client
+                                .get_account(&amm_info.coin_creator_vault_authority)
+                                .is_err()
+                            {
+                                warn!(
+                                    "Skipping Pump pool {}: missing coin creator vault authority {}",
+                                    pump_pool_pubkey, amm_info.coin_creator_vault_authority
+                                );
+                                continue;
+                            }
 
                             pool_data.add_pump_pool(
                                 pool_address,
@@ -397,13 +408,13 @@ pub async fn initialize_pool_data(
             match rpc_client.get_account(&whirlpool_pool_pubkey) {
                 Ok(account) => {
                     if account.owner != whirlpool_program_id() {
-                        error!(
-                            "Error: Whirlpool pool account is not owned by the Whirlpool program. Expected: {}, Actual: {}",
-                            whirlpool_program_id(), account.owner
+                        warn!(
+                            "Skipping Whirlpool pool {}: wrong owner {}, expected {}",
+                            whirlpool_pool_pubkey,
+                            account.owner,
+                            whirlpool_program_id()
                         );
-                        return Err(anyhow::anyhow!(
-                            "Whirlpool pool account is not owned by the Whirlpool program"
-                        ));
+                        continue;
                     }
 
                     match Whirlpool::try_deserialize(&account.data) {
@@ -442,6 +453,13 @@ pub async fn initialize_pool_data(
                                 &whirlpool_program_id(),
                             )
                             .0;
+                            if rpc_client.get_account(&whirlpool_oracle).is_err() {
+                                warn!(
+                                    "Skipping Whirlpool pool {}: missing oracle {}",
+                                    whirlpool_pool_pubkey, whirlpool_oracle
+                                );
+                                continue;
+                            }
 
                             let whirlpool_tick_arrays = update_tick_array_accounts_for_onchain(
                                 &whirlpool,

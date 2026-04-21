@@ -5,6 +5,7 @@ use crate::signer::{LocalKeypairSigner, TransactionSigner};
 use crate::transaction::build_and_send_transaction;
 use anyhow::Context;
 use solana_client::rpc_client::RpcClient;
+use solana_sdk::address_lookup_table::state::AddressLookupTable;
 use solana_sdk::address_lookup_table::AddressLookupTableAccount;
 use solana_sdk::hash::Hash;
 use solana_sdk::pubkey::Pubkey;
@@ -13,6 +14,7 @@ use solana_sdk::signer::Signer;
 use solana_sdk::{
     address_lookup_table::state::AddressLookupTable, compute_budget::ComputeBudgetInstruction,
 };
+use solana_sdk::compute_budget::ComputeBudgetInstruction;
 use spl_associated_token_account::get_associated_token_address_with_program_id;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -83,66 +85,87 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
     });
 
     for mint_config in &config.routing.mint_config_list {
-        // Get the mint account info to check owner
-        let mint_owner = rpc_client
-            .get_account(&Pubkey::from_str(&mint_config.mint).unwrap())
-            .unwrap()
-            .owner;
+        let mint_pubkey = Pubkey::from_str(&mint_config.mint).unwrap();
+        let mint_owner = rpc_client.get_account(&mint_pubkey)?.owner;
         let wallet_token_account = get_associated_token_address_with_program_id(
             &wallet_kp.pubkey(),
-            &Pubkey::from_str(&mint_config.mint).unwrap(),
+            &mint_pubkey,
             &mint_owner,
         );
 
         println!("   Token mint: {}", mint_config.mint);
+        println!("   Mint owner program: {}", mint_owner);
         println!("   Wallet token ATA: {}", wallet_token_account);
-        // Check if the PWEASE token account exists and create it if it doesn't
         println!("\n   Checking if token account exists...");
-        loop {
-            match rpc_client.get_account(&wallet_token_account) {
-                Ok(_) => {
-                    println!("   token account exists!");
-                    break;
-                }
-                Err(_) => {
-                    println!("   token account does not exist. Creating it...");
+        if rpc_client.get_account(&wallet_token_account).is_err() {
+            println!("   token account does not exist. Creating it...");
+            let create_ata_ix =
+                spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                    &wallet_kp.pubkey(),
+                    &wallet_kp.pubkey(),
+                    &mint_pubkey,
+                    &mint_owner,
+                );
 
-                    // Create the instruction to create the associated token account
-                    let create_ata_ix =
-                            spl_associated_token_account::instruction::create_associated_token_account_idempotent(
-                                &wallet_kp.pubkey(), // Funding account
-                                &wallet_kp.pubkey(), // Wallet account
-                                &Pubkey::from_str(&mint_config.mint).unwrap(),   // Token mint
-                                &spl_token::ID,      // Token program
-                            );
+            let blockhash = rpc_client.get_latest_blockhash()?;
+            let compute_unit_price_ix = ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
+            let compute_unit_limit_ix = ComputeBudgetInstruction::set_compute_unit_limit(60_000);
 
-                    // Get a recent blockhash
-                    let blockhash = rpc_client.get_latest_blockhash()?;
+            let create_ata_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+                &[compute_unit_price_ix, compute_unit_limit_ix, create_ata_ix],
+                Some(&wallet_kp.pubkey()),
+                &[&wallet_kp],
+                blockhash,
+            );
 
-                    let compute_unit_price_ix =
-                        ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
-                    let compute_unit_limit_ix =
-                        ComputeBudgetInstruction::set_compute_unit_limit(60_000);
+            let sig = rpc_client
+                .send_and_confirm_transaction(&create_ata_tx)
+                .context("Failed to create trade mint ATA")?;
+            println!("   token account created successfully! Signature: {}", sig);
+        } else {
+            println!("   token account exists!");
+        }
+    }
 
-                    // Create the transaction
-                    let create_ata_tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
-                        &[compute_unit_price_ix, compute_unit_limit_ix, create_ata_ix],
-                        Some(&wallet_kp.pubkey()),
-                        &[&wallet_kp],
-                        blockhash,
+    let mut base_mints = vec![
+        ("WSOL", crate::constants::sol_mint()),
+        ("USDC", Pubkey::from_str("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v").unwrap()),
+        ("USD1", Pubkey::from_str("USD1ttGY1N17NEEHLmELoaybftRBUSErhqYiQzvEmuB").unwrap()),
+    ];
+
+    for (mint_name, mint) in base_mints.drain(..) {
+        let ata = get_associated_token_address_with_program_id(
+            &wallet_kp.pubkey(),
+            &mint,
+            &spl_token::ID,
+        );
+        info!("Checking {} ATA: {}", mint_name, ata);
+        match rpc_client.get_account(&ata) {
+            Ok(_) => info!("{} ATA already exists", mint_name),
+            Err(_) => {
+                info!("{} ATA does not exist, creating...", mint_name);
+                let create_ata_ix =
+                    spl_associated_token_account::instruction::create_associated_token_account_idempotent(
+                        &wallet_kp.pubkey(),
+                        &wallet_kp.pubkey(),
+                        &mint,
+                        &spl_token::ID,
                     );
-
-                    // Send the transaction
-                    match rpc_client.send_and_confirm_transaction(&create_ata_tx) {
-                        Ok(sig) => {
-                            println!("   token account created successfully! Signature: {}", sig);
-                        }
-                        Err(e) => {
-                            println!("   Failed to create token account: {:?}", e);
-                            return Err(anyhow::anyhow!("Failed to create token account"));
-                        }
-                    }
-                }
+                let blockhash = rpc_client.get_latest_blockhash()?;
+                let compute_unit_price_ix =
+                    ComputeBudgetInstruction::set_compute_unit_price(1_000_000);
+                let compute_unit_limit_ix =
+                    ComputeBudgetInstruction::set_compute_unit_limit(60_000);
+                let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+                    &[compute_unit_price_ix, compute_unit_limit_ix, create_ata_ix],
+                    Some(&wallet_kp.pubkey()),
+                    &[&wallet_kp],
+                    blockhash,
+                );
+                let sig = rpc_client
+                    .send_and_confirm_transaction(&tx)
+                    .context(format!("Failed to create {} ATA", mint_name))?;
+                info!("{} ATA created successfully. Signature: {}", mint_name, sig);
             }
         }
     }
@@ -168,8 +191,6 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
         .await?;
 
         let mint_pool_data = Arc::new(Mutex::new(pool_data));
-
-        // TODO: Add logic to periodically refresh pool data
 
         let config_clone = config.clone();
         let mint_config_clone = mint_config.clone();
@@ -197,17 +218,14 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
                                     info!("   Successfully loaded lookup table: {}", pubkey);
                                 }
                                 Err(e) => {
-                                    error!(
-                                        "   Failed to deserialize lookup table {}: {}",
-                                        pubkey, e
-                                    );
-                                    continue; // Skip this lookup table but continue processing others
+                                    error!("   Failed to deserialize lookup table {}: {}", pubkey, e);
+                                    continue;
                                 }
                             }
                         }
                         Err(e) => {
                             error!("   Failed to fetch lookup table account {}: {}", pubkey, e);
-                            continue; // Skip this lookup table but continue processing others
+                            continue;
                         }
                     }
                 }
@@ -216,7 +234,7 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
                         "   Invalid lookup table pubkey string {}: {}",
                         lookup_table_account, e
                     );
-                    continue; // Skip this lookup table but continue processing others
+                    continue;
                 }
             }
         }
@@ -277,6 +295,7 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
                         wallet_signer_clone.as_ref(),
                         &config_clone,
                         &*guard, // Dereference the guard here
+                        &*guard,
                         &sending_rpc_clients_clone,
                         latest_blockhash,
                         &lookup_table_accounts_list,
@@ -287,6 +306,7 @@ pub async fn run_bot(config_path: &str) -> anyhow::Result<()> {
                         wallet_signer_clone.as_ref(),
                         &config_clone,
                         &*guard, // Dereference the guard here
+                        &*guard,
                         &sending_rpc_clients_clone,
                         latest_blockhash,
                         &lookup_table_accounts_list,
@@ -384,3 +404,13 @@ fn load_keypair(private_key: &str) -> anyhow::Result<Keypair> {
 
     anyhow::bail!("Failed to load keypair from: {}", private_key)
 }
+/*
+git status
+git stash -u              # only if you have local uncommitted changes
+git fetch origin
+git checkout main
+git pull --ff-only
+cargo check
+cargo run --release
+
+*/

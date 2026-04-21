@@ -45,6 +45,7 @@ pub struct MintConfig {
 
     pub lookup_table_accounts: Option<Vec<String>>,
     pub process_delay: u64,
+    pub validate_pools: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
