@@ -35,9 +35,9 @@ futures = "0.3"
 # Utilities
 anyhow = "1.0"
 thiserror = "1.0"
-rand = "0.8"
+rand = "0.9"
 bs58 = "0.4"
-borsh = "0.10.3"
+borsh = "1.6.1"
 bytemuck = { version = "1.16.1", features = ["derive"] }
 
 # Command line argument parsing
